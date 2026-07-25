@@ -453,3 +453,214 @@ python bench/resolve_fusions.py bench/results/hlo bench/results/th
   independent review — weaker evidence than an outside attack would have been.
 - `no_remat` exactness rests on the argument that `jax.checkpoint` is
   semantically the identity in a forward-only computation. Not separately tested.
+
+---
+
+# Tier 1′ — batching across streams
+
+## The blocker, and what it costs to remove
+
+`KVCache.index` is a **scalar** shared by the whole batch (`models.py:43`,
+`index  # scalar integer (i32)`). Every row of a batch must therefore sit at the
+same rollout step, so a served batch can only be formed from sessions that
+started together and never diverge. That is the definition of static batching,
+and it is what makes continuous batching impossible rather than merely awkward.
+
+`ragged_kv` in `bench/patches.py` makes the index shape `(B,)`. Three things
+have to change together, and missing any one of them is silently wrong rather
+than loud:
+
+1. **`update`** — a scalar `dynamic_update_slice` becomes a `vmap` of per-row
+   writes at `index % window_size`.
+2. **`get_ordered_kv`** — the causal/written mask has to be built per row, from
+   `idx.reshape(-1, 1, 1, 1)` rather than a scalar.
+3. **RoPE `start_pos`** — this is the trap. The released code is
+   `jnp.outer(jnp.arange(T) + start_pos, inv_freq)`, and `jnp.outer`
+   **flattens its arguments**. Passing a `(B,)` `start_pos` does not raise; it
+   silently produces a `(B*T, dim)` table and every row gets the wrong angle.
+   The patched version branches on `sp.ndim` and builds `(B, T)` explicitly.
+
+## The measurement that decides how much this is worth
+
+Aggregate throughput, one `frame` step, recommended stack, H100 (log
+`bzce85sia`). B=32 OOMs in prefill (20.7 GB single allocation).
+
+|  B | frame ms | single-stream fps | aggregate fps | MFU |
+|---:|---------:|------------------:|--------------:|----:|
+|  1 |   25.716 |              38.9 |          38.9 | 26.3% |
+|  2 |   39.437 |              25.4 |          50.7 | 34.3% |
+|  4 |   65.482 |              15.3 |          61.1 | 41.3% |
+|  8 |  116.586 |               8.6 |          68.6 | 46.4% |
+| 16 |  220.085 |               4.5 |          72.7 | 49.2% |
+
+The curve is almost exactly affine — a two-parameter fit lands within 2% at
+every point, and within 0.1% for B>=4:
+
+    t(B) = 13.33 ms  +  12.93 ms x B
+
+That decomposition is the whole story of this model's inference:
+
+- **13.33 ms fixed.** Work done once per step no matter how many streams share
+  it: streaming 3.147 GB of bf16 weights through five dynamics forwards, 15.7
+  GB/frame, ~1180 GB/s or 50% of the measured 2353 GB/s ceiling. At B=1 this is
+  **52% of the frame**.
+- **12.93 ms/stream marginal.** 5.02 TFLOP of real per-stream compute at 388
+  TFLOP/s, 52% MFU.
+
+So the batching ceiling is `1000/12.93` = **77.4 fps aggregate, 1.99x over
+B=1** — and B=8 already captures 89% of it, B=16 94%. There is no configuration
+in which batching is worth more than 2x, because the fixed half is all it can
+amortise.
+
+**Batching buys throughput and spends latency.** Single-stream frame time goes
+from 25.7 ms to 220 ms. For a world model driven by a human or a policy in the
+loop, that is the wrong trade past about B=4.
+
+---
+
+# Tier 2 — fp8/int8 W8A16 GEMM with in-register dequant — REJECTED
+
+## Why a custom kernel at all
+
+The earlier XLA-level attempt (`fp8_weights` in `bench/patches.py`) wrote
+`dot(convert(w_fp8) * scale, x)` and XLA materialised the dequantised bf16
+matrix in HBM *before* the GEMM. Traffic went up, `loop_multiply_fusion_*`
+became 30% of GPU time, zero fp8 kernels were emitted, and the frame got 1.37x
+**slower**. A Pallas kernel is the only way to keep the dequant in registers.
+
+`bench/fp8_gemm.py` implements it. Two dead ends before a working kernel:
+`float8_e4m3fn -> bf16` and `-> f32 -> bf16` both hit
+`LLVM ERROR: Unsupported rounding mode for conversion` in this JAX's Triton.
+Switched to **int8 with per-output-channel symmetric scales** — identical 1
+byte/weight (the bottleneck is weight *bytes*, not weight *precision*), a
+universally supported conversion, and more accurate for weights than
+per-tensor e4m3. Measured rel err 0.0071 across every shape, consistent with
+int8 quantisation and stable, so the kernel is numerically sound.
+
+## A prediction stated in advance, and falsified
+
+The file predicted fp8 would help `fc_in`/`fc_out` (28-43% of peak bandwidth,
+84% of parameters) and do little for `to_q`/`to_kv` (1-6%, latency-bound).
+The first measurement at bm=16/bn=64/bk=64 inverted it exactly:
+
+| shape | M=296 | M=4736 |
+|---|---:|---:|
+| to_q  | **1.04x** | 0.20x |
+| to_kv | 0.78x | 0.44x |
+| fc_in | 0.25x | **0.14x** |
+| fc_out| 0.44x | 0.19x |
+
+`fc_in`, predicted to gain most, was worst. So the cost was not weight bytes —
+it was the tile. Two concrete causes: bm=16 is below the m=64 that H100 `wgmma`
+issues at, and an `(m, n)` grid with full-K blocks re-walks the weight matrix
+once per m-block (19x at M=296, 296x at M=4736) where cuBLAS walks it once.
+
+## The SRAM budget that justified bm=16 was imaginary
+
+The docstring argued bm=16 from a 228 KB/SM budget. That was wrong: in the
+Triton backend a `BlockSpec` is a **block pointer**, and `a_ref[:, sl]` lowers
+to a load of just that slice, so the full-K block is never materialised. The
+sweep proves it — bm=128 with K=1920 (a nominal 480 KB "block") compiles and
+runs fine. bm=16 was self-imposed for no reason.
+
+Sweeping tiles at M=296 (log `b9dtdqdri`), best per shape:
+
+| shape | cuBLAS | best Pallas tile | best time | speedup |
+|---|---:|---|---:|---:|
+| to_q  1920x1920  | 58.3 us | bm=64 bn=64 bk=64   | 48.6 us | **1.20x** |
+| fc_out 7680x1920 | 72.9 us | bm=64 bn=128 bk=128 | 133.6 us | 0.55x |
+| fc_in 1920x15360 (M=4736) | 520.8 us | bm=128 bn=128 bk=64 | 714.1 us | 0.70x |
+
+Better tiling moved `fc_in` from 0.14x to 0.70x and `fc_out` from 0.44x to
+0.55x — a 3-5x improvement over my first kernel, and still a loss. `bm=320`,
+the one tile that would cover M=296 in a single m-block and remove the re-read
+entirely, fails to lower at all.
+
+## Why this is rejected rather than iterated
+
+Two independent reasons, either sufficient.
+
+**The prize is capped, and small.** The Tier 1′ fit says the frame is
+`13.33 ms fixed + 12.93 ms x B`, where the fixed part *is* the weight stream.
+A **perfect** W8 kernel halves only that:
+
+| B | frame | fixed share | perfect-W8 speedup |
+|--:|------:|------------:|-------------------:|
+| 1 | 26.3 ms | 51% | 1.34x |
+| 4 | 65.0 ms | 20% | 1.11x |
+| 16 | 220.2 ms | 6% | **1.03x** |
+
+Batching and quantisation attack the **same 13.33 ms**, so they are
+substitutes, not additives. Anyone who batches has already collected what fp8
+was going to pay, and 1.03x does not justify a hand-written GEMM.
+
+**The remaining gap is a research-grade kernel.** Closing 0.55x -> 1.0x on
+`fc_out` means matching cuBLAS `nvjet_*` with async copies, warp specialisation,
+software pipelining and swizzled layouts — the Marlin/CUTLASS feature set,
+which Pallas-on-Triton at this JAX version does not readily express. That is
+weeks of work for a ceiling of 1.34x in the one regime (B=1) where it helps.
+
+The single measured win, `to_q` at 1.20x, does not survive scrutiny either:
+cuBLAS's own time for that shape moved 83.4 -> 58.3 us between two runs, so at
+these sizes run-to-run variance is comparable to the effect. `to_q` is also
+7.4 MB of 3.147 GB of weights.
+
+**Rejected on evidence, same as the XLA fp8 attempt.** The kernel, the sweep
+and the numbers are kept in `bench/fp8_gemm.py` so the result is reproducible
+and the negative is auditable.
+
+## What ragged indices cost, and what they buy
+
+**Cost.** Same-container A/B at B=8, recommended stack, `decode`/`prefill`/
+`encode` skipped (log `b2fyjwe06`):
+
+| arm | dyn_fwd | ladder | frame | aggregate |
+|---|---:|---:|---:|---:|
+| A `fast_kv_write` + `no_roll_kv` (scalar index) | 24.299 ms | 107.877 ms | 116.733 ms | 68.5 fps |
+| B `ragged_kv` (per-row index) | 23.650 ms | 114.490 ms | 122.915 ms | 65.1 fps |
+
+**5.3% slower.** All of it is in `ladder` (+6.1%) — the vmap'd per-row
+`dynamic_update_slice` — while `dyn_fwd` is marginally *faster*. Arm A
+reproduces the independent batch sweep to 0.13% (116.733 vs 116.586 ms), so
+this is a real 5.3% and not run-to-run noise.
+
+**Buy.** `bench/scheduler.py` implements slot admission/eviction over the
+ragged cache and compares it against the static policy a scalar index forces,
+under Poisson arrivals with lognormal session lengths (CV 0.6), driven by the
+measured `t(B)` above. Continuous batching is charged the full 5.3% penalty;
+static is not.
+
+The mechanism is padding: a rollout compiled at width B computes idle slots
+rather than skipping them, so a step costs `t(B)` whether 8 slots are busy or
+1, and `fps = occupancy x B / t(B)`. Occupancy is then purely a scheduling
+property. At 85% offered load:
+
+| width | policy | occupancy | fps | p95 wait |
+|---:|---|---:|---:|---:|
+| 4 | static | 62.7% | 38.2 | 135.6 s |
+| 4 | continuous | 98.5% | 57.1 | 21.8 s |
+| 8 | static | 51.2% | 34.8 | 141.4 s |
+| 8 | continuous | 92.1% | **59.4** | 10.4 s |
+| 16 | static | 44.2% | 31.9 | 156.1 s |
+| 16 | continuous | 85.8% | 58.7 | **7.0 s** |
+
+Static batching does best at *small* width (cohorts drain sooner), so the fair
+comparison is best-config against best-config. Over 5 seeds:
+
+    best static 38.3-39.6 fps   best continuous 59.1-66.9 fps   1.59x mean
+    (min 1.51x, max 1.75x, 5/5 seeds favour continuous, ranges disjoint)
+
+So `ragged_kv` gives up 5.3% of peak to recover far more than that in
+occupancy, and cuts p95 admission wait by ~20x. The 1.59x is a **scheduling**
+result, not a kernel one, and it is bounded above by the 1.99x batching ceiling
+— which is why it is worth doing and also why it is the last large win
+available on this axis without changing the model.
+
+### The one thing to check before trusting the 1.59x
+
+The simulation's cost model is measured, but the *policy* comparison is
+simulated, not run on a GPU. Its load-bearing assumption is that session
+lengths vary (`--length-cv 0.6`). At `--length-cv 0` the gain collapses to
+1.00-1.19x, because a uniform cohort drains all at once and static batching
+loses nothing. If served sessions really are fixed-length and synchronised,
+static batching is fine and `ragged_kv` is a 5.3% loss for nothing.

@@ -214,7 +214,8 @@ def main():
                     help="SDPA backend for the block-split path; 'cudnn' = flash")
     ap.add_argument("--patches", nargs="*", default=[],
                     help="optimisations from bench/patches.py: no_roll_kv "
-                         "fast_kv_write no_remat block_attn bf16_weights")
+                         "fast_kv_write no_remat block_attn bf16_weights "
+                         "ragged_kv fp8_weights")
     args = ap.parse_args()
 
     if args.patches:
@@ -225,6 +226,8 @@ def main():
             # Never benchmark a patch that changes the answer.
             if "no_roll_kv" in code_patches:
                 _patches.check_kv_equivalence(pkg=MODEL_PKG)
+            if "ragged_kv" in code_patches:
+                _patches.check_ragged_kv_equivalence(pkg=MODEL_PKG)
             if "block_attn" in code_patches:
                 _patches.set_block_attn_impl(args.block_attn_impl)
                 _patches.check_block_attn_equivalence(pkg=MODEL_PKG)
@@ -381,6 +384,19 @@ def main():
         dyn_caches = dynamics.create_static_caches(
             batch_size=B, n_latents=N_LATENTS,
             window_size=args.ctx, n_agent=0, dtype=compute_dtype)
+        if "ragged_kv" in args.patches:
+            # Rebuild with per-sequence indices. `create_static_caches` makes a
+            # scalar-index cache, and _ragged_update falls back to the scalar
+            # path for those -- so without this the patch would be a no-op and
+            # we would be timing the aligned path under a ragged label.
+            from bench import patches as _p
+            dyn_caches = {i: _p.ragged_kv_init(
+                              KVCache, c.k.shape[0], c.window_size,
+                              c.k.shape[2], c.k.shape[3], dtype=c.k.dtype)
+                          for i, c in dyn_caches.items()}
+            _ragged_rows = next(iter(dyn_caches.values())).index.shape[0]
+            print(f"  ragged_kv: per-sequence index over {_ragged_rows} rows "
+                  f"({_ragged_rows // S_dyn} sessions x {S_dyn} tokens)")
         # NOTE: window_size here must match what the serving runtime uses. The
         # decoder cache in Tokenizer.create_static_caches defaults to 1024 even
         # though decoder.context_length is 16 -- see the audit notes.

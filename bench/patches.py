@@ -173,7 +173,8 @@ def param_bytes(model) -> int:
 # driver
 # ---------------------------------------------------------------------------
 
-ALL = ("no_roll_kv", "fast_kv_write", "no_remat", "block_attn", "fp8_weights")
+ALL = ("no_roll_kv", "fast_kv_write", "no_remat", "block_attn", "fp8_weights",
+       "ragged_kv")
 
 
 def apply(names, pkg: str = "dreamer"):
@@ -201,6 +202,14 @@ def apply(names, pkg: str = "dreamer"):
             _ORIGINALS.setdefault("SpaceSelfAttention.__call__",
                                   models.SpaceSelfAttention.__call__)
             models.SpaceSelfAttention.__call__ = _space_attn_call
+        elif name == "ragged_kv":
+            _ORIGINALS.setdefault("KVCache.update", KVCache.update)
+            _ORIGINALS.setdefault("KVCache.get_ordered_kv", KVCache.get_ordered_kv)
+            _ORIGINALS.setdefault("RoPE.__call__",
+                                  models.RotaryEmbedding1D.__call__)
+            KVCache.update = _ragged_update
+            KVCache.get_ordered_kv = _ragged_get_ordered_kv
+            models.RotaryEmbedding1D.__call__ = _ragged_rope_call
         elif name == "fp8_weights":
             _ORIGINALS.setdefault("nnx.Linear.__call__", nnx.Linear.__call__)
             nnx.Linear.__call__ = _linear_fp8_call
@@ -231,6 +240,8 @@ def revert(pkg: str = "dreamer"):
         models.nnx.remat = _ORIGINALS.pop("nnx.remat")
     if "SpaceSelfAttention.__call__" in _ORIGINALS:
         models.SpaceSelfAttention.__call__ = _ORIGINALS.pop("SpaceSelfAttention.__call__")
+    if "RoPE.__call__" in _ORIGINALS:
+        models.RotaryEmbedding1D.__call__ = _ORIGINALS.pop("RoPE.__call__")
     if "nnx.Linear.__call__" in _ORIGINALS:
         nnx.Linear.__call__ = _ORIGINALS.pop("nnx.Linear.__call__")
     # Counters are process-global; leaving them set would let a second config's
@@ -922,3 +933,200 @@ def fp8_gemm_kernels_in_trace(trace_dir: str) -> dict:
             "convert_total_ms": round(sum(conv.values()), 3),
             "verdict": ("fused fp8 GEMM present" if fp8
                         else "NO fp8 kernels -- XLA fell back; patch is overhead")}
+
+
+# ---------------------------------------------------------------------------
+# ragged_kv  --  per-sequence KV positions, the prerequisite for continuous
+#                batching
+# ---------------------------------------------------------------------------
+#
+# `KVCache.index` is a SCALAR shared by the whole batch, so every sequence in a
+# batch must sit at the same rollout step. That is static batching: you can
+# serve N streams only if they all start together and none joins or leaves.
+#
+# The measured reason to care: bandwidth efficiency is set by weight-matrix
+# size, and every GEMM climbs steeply with M. `to_q` runs at 33 TFLOP/s at
+# M=256 and 334 at M=4640 (bench/GEMM_DIAGNOSTIC.md). Batching concurrent
+# sessions is the only lever that fixes small GEMMs without touching numerics --
+# but real sessions join and leave at arbitrary times, which a scalar index
+# cannot express.
+#
+# This makes `index` shape (B,), which requires three changes:
+#   1. update()           per-row writes        (vmap of dynamic_update_slice)
+#   2. get_ordered_kv()   per-row mask          (age computed from index[:,...])
+#   3. RoPE start_pos     per-row rotation      (t = arange(T) + start_pos[:,None])
+#
+# EXACT when all rows share an index: `check_ragged_kv_equivalence` asserts the
+# ragged path reproduces the scalar path, and separately that a genuinely
+# ragged batch matches running each sequence on its own.
+
+_RAGGED_STATS = {"ragged_calls": 0}
+
+
+def _ragged_update(self, k_new, v_new):
+    """`KVCache.update` with a per-sequence write position."""
+    cls = type(self)
+    T = k_new.shape[1]
+    idx = jnp.asarray(self.index)
+    if idx.ndim == 0:                       # scalar cache: defer to the fast path
+        return _update_fast(self, k_new, v_new)
+
+    write_idx = idx % self.window_size      # (B,)
+
+    def _row(buf, new, pos):
+        # buf (W,K,H), new (T,K,H), pos scalar. dynamic_update_slice clamps, and
+        # T==1 can never wrap since pos <= W-1.
+        return jax.lax.dynamic_update_slice(buf, new, (pos, 0, 0))
+
+    k = jax.vmap(_row)(self.k, k_new, write_idx)
+    v = jax.vmap(_row)(self.v, v_new, write_idx)
+    return cls(k=k, v=v, index=idx + T, window_size=self.window_size)
+
+
+def _ragged_get_ordered_kv(self, query_len):
+    """`get_ordered_kv` with a per-sequence mask. Same age algebra as
+    `_get_ordered_kv_inplace`, lifted over the batch axis."""
+    W = self.window_size
+    idx = jnp.asarray(self.index)
+    if idx.ndim == 0:
+        return _get_ordered_kv_inplace(self, query_len)
+
+    idx_b = idx.reshape(-1, 1, 1, 1)                        # (B,1,1,1)
+    j = jnp.arange(W)[None, None, None, :]                  # (1,1,1,W)
+    age = jnp.mod(idx_b - 1 - j, W)                         # (B,1,1,W)
+    i = jnp.arange(query_len)[None, None, :, None]          # (1,1,q,1)
+    causal = age >= (query_len - 1 - i)                     # (B,1,q,W)
+    written = age <= (idx_b - 1)                            # (B,1,1,W)
+    _RAGGED_STATS["ragged_calls"] += 1
+    return self.k, self.v, jnp.logical_and(causal, written)
+
+
+def _ragged_rope_call(self, q, k, start_pos=0):
+    """`RotaryEmbedding1D.__call__` accepting a per-sequence `start_pos`.
+
+    The released version does `jnp.outer(arange(T) + start_pos, inv_freq)`,
+    which silently flattens if `start_pos` is a vector. With ragged positions
+    each sequence needs its own rotation.
+    """
+    T = q.shape[1]
+    sp = jnp.asarray(start_pos)
+    inv = self.inv_freq.value
+
+    if sp.ndim == 0:
+        t = (jnp.arange(T, dtype=self.dtype) + sp)[None, :]       # (1,T)
+    else:
+        t = jnp.arange(T, dtype=self.dtype)[None, :] + sp[:, None]  # (B,T)
+
+    freqs = t[..., None].astype(jnp.float32) * inv[None, None, :]   # (B,T,D/2)
+    cos = jnp.cos(freqs).astype(self.dtype)[:, :, None, :]          # (B,T,1,D/2)
+    sin = jnp.sin(freqs).astype(self.dtype)[:, :, None, :]
+    return self._apply(q, k, cos, sin)
+
+
+def ragged_kv_init(cls, batch_size, window_size, num_kv_heads, head_dim,
+                   dtype=jnp.float32):
+    """`KVCache.init` variant whose index is per-sequence, shape (B,)."""
+    dt = jnp.bfloat16 if dtype == "bfloat16" else dtype
+    return cls(
+        k=jnp.zeros((batch_size, window_size, num_kv_heads, head_dim), dtype=dt),
+        v=jnp.zeros((batch_size, window_size, num_kv_heads, head_dim), dtype=dt),
+        index=jnp.zeros((batch_size,), dtype=jnp.int32),
+        window_size=window_size,
+    )
+
+
+def ragged_stats() -> dict:
+    return dict(_RAGGED_STATS)
+
+
+def check_ragged_kv_equivalence(pkg: str | None = None, window: int = 16,
+                                batch: int = 4, kv_heads: int = 3,
+                                head_dim: int = 8, steps: int = 40,
+                                tol: float = 1e-6):
+    """Two assertions, both against genuinely independent references.
+
+    ALIGNED  a ragged cache whose rows all hold the same index must reproduce
+             the scalar-index path exactly.
+    RAGGED   a batch at genuinely different positions must match running each
+             sequence separately -- the property continuous batching needs and
+             the one a scalar index cannot provide.
+    """
+    # "pipeline" in the released inference repo, "dreamer" in this fork. Both
+    # sit on PYTHONPATH in the bench container and importing the wrong one dies
+    # on an unrelated JAX version skew, so take the same answer the profiler
+    # takes instead of hardcoding either name.
+    if pkg is None:
+        try:
+            from bench.prod_config import MODEL_PKG as pkg
+        except ImportError:
+            pkg = "dreamer"
+    models = importlib.import_module(f"{pkg}.models")
+    KVCache = models.KVCache
+    orig_get = _ORIGINALS.get("KVCache.get_ordered_kv", KVCache.get_ordered_kv)
+    orig_upd = _ORIGINALS.get("KVCache.update", KVCache.update)
+
+    def attend(k, v, m, q):
+        logits = jnp.einsum("bqnh,bknh->bnqk", q, k) * head_dim ** -0.5
+        logits = jnp.where(m, logits, jnp.finfo(logits.dtype).min)
+        return jnp.einsum("bnqk,bknh->bqnh", jax.nn.softmax(logits, -1), v)
+
+    key = jax.random.PRNGKey(0)
+
+    # --- 1. aligned: ragged must equal scalar ---------------------------------
+    c_scalar = KVCache.init(batch, window, kv_heads, head_dim, dtype=jnp.float32)
+    c_ragged = ragged_kv_init(KVCache, batch, window, kv_heads, head_dim,
+                              dtype=jnp.float32)
+    worst_aligned = 0.0
+    for t in range(steps):
+        key, k1, k2, k3 = jax.random.split(key, 4)
+        kn = jax.random.normal(k1, (batch, 1, kv_heads, head_dim))
+        vn = jax.random.normal(k2, (batch, 1, kv_heads, head_dim))
+        q = jax.random.normal(k3, (batch, 1, kv_heads, head_dim))
+        c_scalar = orig_upd(c_scalar, kn, vn)
+        c_ragged = _ragged_update(c_ragged, kn, vn)
+        a = attend(*orig_get(c_scalar, query_len=1), q)
+        b = attend(*_ragged_get_ordered_kv(c_ragged, query_len=1), q)
+        e = float(jnp.max(jnp.abs(a - b)))
+        worst_aligned = max(worst_aligned, e)
+        assert e <= tol, f"aligned mismatch at step {t}: {e}"
+
+    # --- 2. ragged: batch must equal per-sequence-alone -----------------------
+    # Give each row a different number of writes, then compare against caches
+    # advanced individually. This is the case a scalar index cannot represent.
+    offsets = [0, 3, window, window + 7][:batch]
+    c_multi = ragged_kv_init(KVCache, batch, window, kv_heads, head_dim,
+                             dtype=jnp.float32)
+    singles = [ragged_kv_init(KVCache, 1, window, kv_heads, head_dim,
+                              dtype=jnp.float32) for _ in offsets]
+    key = jax.random.PRNGKey(7)
+    n_steps = max(offsets) + 5
+    for t in range(n_steps):
+        key, k1, k2 = jax.random.split(key, 3)
+        kn = jax.random.normal(k1, (batch, 1, kv_heads, head_dim))
+        vn = jax.random.normal(k2, (batch, 1, kv_heads, head_dim))
+        active = jnp.array([t >= o for o in offsets])
+        # Rows advance only once their session has "joined": emulate by writing
+        # the same values but holding the index for not-yet-active rows.
+        prev = c_multi.index
+        c_multi = _ragged_update(c_multi, kn, vn)
+        c_multi = type(c_multi)(k=c_multi.k, v=c_multi.v,
+                                index=jnp.where(active, c_multi.index, prev),
+                                window_size=window)
+        for s, o in enumerate(offsets):
+            if t >= o:
+                singles[s] = _ragged_update(singles[s], kn[s:s + 1], vn[s:s + 1])
+
+    key, kq = jax.random.split(key)
+    q = jax.random.normal(kq, (batch, 1, kv_heads, head_dim))
+    got = attend(*_ragged_get_ordered_kv(c_multi, query_len=1), q)
+    worst_ragged = 0.0
+    for s in range(batch):
+        ref = attend(*_ragged_get_ordered_kv(singles[s], query_len=1), q[s:s + 1])
+        e = float(jnp.max(jnp.abs(ref - got[s:s + 1])))
+        worst_ragged = max(worst_ragged, e)
+        assert e <= tol, f"ragged row {s} (offset {offsets[s]}) mismatch: {e}"
+
+    print(f"check_ragged_kv_equivalence: PASS  aligned {worst_aligned:.2e} over "
+          f"{steps} writes; ragged {worst_ragged:.2e} across offsets {offsets} "
+          f"(window {window})")
+    return max(worst_aligned, worst_ragged)

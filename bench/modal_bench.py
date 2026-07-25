@@ -624,6 +624,28 @@ def dump_hlo(batch: int = 1, steps: int = 2, param_dtype: str = "bfloat16",
     RESULTS_VOLUME.commit()
 
 
+@app.function(gpu=GPU_TYPE, timeout=2 * H)
+def gemm_probe(ms: str = ""):
+    """Sweep the model's real Linear shapes across M to decide whether the
+    27%-of-bandwidth figure is a tiling artefact or intrinsic to low M.
+
+    This gates the optimisation plan: if a nearby M is much faster, padding the
+    token axis is a cheap win and worth doing before any quantisation work. If
+    the whole low-M band is flat, only moving fewer bytes helps.
+    """
+    import json
+    import os
+    peaks = ""
+    p = f"{RESULTS_PATH}/measured_peaks.json"
+    if os.path.exists(p):
+        d = json.load(open(p))
+        peaks = f"--peak-tflops {d['tflops_bf16']:.1f} --peak-bw {d['gbps']:.0f}"
+    extra = f"--ms {ms}" if ms else ""
+    _sh(f"python bench/gemm_probe.py {peaks} {extra} "
+        f"--json {RESULTS_PATH}/gemm_probe.json")
+    RESULTS_VOLUME.commit()
+
+
 # ---------------------------------------------------------------------------
 # generic runner, for the edit -> run loop
 # ---------------------------------------------------------------------------
