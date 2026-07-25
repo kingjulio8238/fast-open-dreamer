@@ -871,3 +871,97 @@ The lesson for what remains: prefer profiling the *shipped* configuration and
 attributing time to source lines over reasoning about kernel classes in the
 abstract. The kernel-class table said "GEMM 58.8%, attention 1.7%" and that was
 true and completely misleading.
+
+---
+
+# Is it 4x, and is it the same quality? No, and not proven.
+
+Both halves of the headline needed checking and both came back qualified.
+
+## The 4.00x was not an apples-to-apples comparison
+
+It compared the **optimized engine at B=16** (90.3 fps aggregate) against the
+**released baseline at B=1** (22.3 fps). Those are different quantities:
+throughput-under-batching versus single-stream latency. The released code has a
+batch dimension and batches perfectly well, so crediting the optimization stack
+with the batching gain is double counting.
+
+This document already warned about exactly this — "no steps=4 B=16 baseline was
+measured, so no batch speedup is claimed here" — and then the claim was made
+anyway. The missing measurement has now been taken (log `bp7js0475`):
+
+| config | baseline | optimized | like-for-like |
+|---|---:|---:|---:|
+| B=1 | 44.763 ms (22.3 fps) | 24.278 ms (41.2 fps) | **1.84x** |
+| B=16 | 263.348 ms (60.8 fps agg) | 177.190 ms (90.3 fps agg) | **1.49x** |
+
+**The defensible engine speedup is 1.84x at B=1 and 1.49x at B=16.** The
+released code already reaches 60.8 fps aggregate at B=16 on its own, and the
+gain shrinks with batch because `bf16_weights` — the largest single patch —
+attacks the fixed weight-streaming term that batching already amortises.
+
+"4x" survives only as a *deployment* statement — one H100 serving 90.3 fps
+aggregate against a naive single-stream 22.3 — and it should be labelled as
+such, never as the engine's speedup.
+
+## Quality: measured for the first time, and not clean
+
+Every speed benchmark in this document runs on **randomly-initialised weights**
+(`profile_inference.py` says so in its docstring), and every prior FVD run
+varied only `--steps`. The optimization stack had therefore never been put in
+front of a real checkpoint. `quality_rollout.py` now takes `--patches`, so it
+can be.
+
+Real checkpoint, steps=4, 8 windows, 96-frame autoregressive rollout, n=6
+paired seeds, baseline vs the full stack (logs `bp7js0475`, `bhks0ndyh`):
+
+| metric | baseline | optimized | delta | paired t(5) | seeds worse |
+|---|---:|---:|---:|---:|---:|
+| **FVD** (lower better) | 514.38 | 528.52 | **+14.14** | **2.28** | **5 / 6** |
+| std ratio (higher better) | 0.9648 | 0.9653 | +0.0005 | 0.13 | 2 / 6 |
+| motion vs gt | 0.9433 | 0.9483 | +0.0050 | 0.27 | 2 / 6 |
+| drift at horizon | 0.01066 | 0.01070 | +0.00004 | 0.19 | 3 / 6 |
+
+Critical |t(5)| at p<0.05 is 2.571, so **FVD does not reach significance — but
+it is close (t=2.28, p~0.07) and 5 of 6 seeds move the same way.** That is not
+a clean bill of health. It is the same signature as the steps=2 question, where
+n=2 looked fine and n=6 showed a real regression; the honest reading here is
+"suggestive of a small real cost, underpowered to confirm", and by the effect
+size (Cohen's d 0.93) it would take roughly n=12 to settle.
+
+**The good news is specific and it is the thing that was actually at risk.**
+Drift at horizon is identical to four decimal places. That was the real worry:
+a ~5e-03 relative difference per attention call, compounded through 30 layers x
+5 forwards x 96 autoregressive frames where each output becomes the next
+input, could plausibly have diverged. It does not. Nor does variance collapse
+(std ratio) or motion.
+
+## Which patch is responsible
+
+Three of the six are exact and cannot be:
+
+    no_remat        identity in a forward-only computation
+    fast_kv_write   verified write max|diff| 0.00e+00
+    no_roll_kv      verified read max|diff| 2.38e-07
+
+The candidates are `bf16_weights` (weight rounding, never quality-gated —
+flagged as "verify against a real checkpoint before shipping" from the start
+and this is the first time that was done), and `block_attn` / `sdpa_cudnn`
+(both ~5e-03 relative, bf16 accumulation order).
+
+**Untested and the obvious next step:** rerun the n=6 gate with `bf16_weights`
+dropped. If FVD returns to baseline, the stack splits cleanly into an
+exact-plus-cuDNN tier that is free, and a `bf16_weights` tier that trades ~2.7%
+FVD for the largest single speedup. That is a decision worth making explicitly
+rather than by default.
+
+## Corrected summary
+
+| claim | status |
+|---|---|
+| 1.84x at B=1, like-for-like | **measured** |
+| 1.49x at B=16, like-for-like | **measured** |
+| 4.00x engine speedup | **withdrawn** — conflated batching with the stack |
+| 90.3 fps aggregate on one H100 | measured, deployment framing only |
+| no long-horizon drift from the stack | **measured**, n=6, the main risk cleared |
+| identical quality | **not established** — FVD +14.1, 5/6 seeds, p~0.07 |

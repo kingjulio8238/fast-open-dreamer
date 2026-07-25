@@ -576,7 +576,8 @@ def quality_steps(steps: str = "1 2 4 8", trials: int = 8,
 @app.function(gpu=GPU_TYPE, timeout=4 * H)
 def quality_rollout(steps: str = "1 2 4", seeds: str = "0 1", windows: int = 8,
                     horizon: int = 96, context_frames: int = 16,
-                    checkpoint: str = CKPT_DIR):
+                    checkpoint: str = CKPT_DIR, patches: str = "",
+                    tag: str = ""):
     """Long-horizon drift + FVD. The compounding test that one-step accuracy
     cannot cover: few-step samplers fail by accumulating error, not by being
     wrong on any single step.
@@ -590,10 +591,11 @@ def quality_rollout(steps: str = "1 2 4", seeds: str = "0 1", windows: int = 8,
     _sh("python download_vpt_sample.py --overwrite", cwd="/root/od-inference")
     ENV["OD_INFERENCE_REPO"] = "/root/od-inference"
     ENV["OD_FORK_REPO"] = "/root/repo"
+    pf = f"--patches {patches} " if patches else ""
     _sh(f"python bench/quality_rollout.py --checkpoint {checkpoint} "
         f"--steps {steps} --seeds {seeds} --windows {windows} --horizon {horizon} "
-        f"--context-frames {context_frames} "
-        f"--out-dir {RESULTS_PATH}/quality_rollout")
+        f"--context-frames {context_frames} {pf}"
+        f"--out-dir {RESULTS_PATH}/quality_rollout{('_' + tag) if tag else ''}")
     RESULTS_VOLUME.commit()
 
 

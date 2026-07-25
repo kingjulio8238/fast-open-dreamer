@@ -59,11 +59,33 @@ def main() -> None:
                          "step-count difference has no error bar; two or three "
                          "give the seed-to-seed spread it must beat to be real.")
     ap.add_argument("--out-dir", default="/results/quality_rollout")
+    # The speed benchmarks all run on randomly-initialised weights, which is
+    # fine for timing and says nothing about output quality. This is the only
+    # path that puts the optimisation stack in front of a REAL checkpoint and
+    # measures what comes out, so `--patches ""` vs the full stack is the
+    # apples-to-apples released-vs-optimised quality comparison.
+    ap.add_argument("--patches", nargs="*", default=[],
+                    help="optimisation stack to apply before rolling out")
+    ap.add_argument("--block-attn-impl", default="cudnn")
     args = ap.parse_args()
 
     import jax
     import jax.numpy as jnp
     import numpy as np
+
+    if args.patches:
+        from bench import patches as _patches
+        code_patches = [q for q in args.patches if q != "bf16_weights"]
+        if code_patches:
+            _patches.apply(code_patches, pkg="pipeline")
+            if "no_roll_kv" in code_patches:
+                _patches.check_kv_equivalence(pkg="pipeline")
+            if "block_attn" in code_patches:
+                _patches.set_block_attn_impl(args.block_attn_impl)
+                _patches.check_block_attn_equivalence(pkg="pipeline")
+            if "sdpa_cudnn" in code_patches:
+                _patches.check_sdpa_cudnn_equivalence()
+        print(f"quality run with patches: {args.patches}", flush=True)
 
     from pipeline.checkpointing import DynamicsCheckpointBundle
     from pipeline.generation import DenoiseSchedule, latent_rollout
@@ -87,6 +109,20 @@ def main() -> None:
             model_names={"tokenizer", "dynamics_ema"})
         tokenizer, dynamics = bundle.tokenizer, bundle.dynamics_ema
         cfg = dynamics.cfg
+
+        if args.patches:
+            from bench import patches as _patches
+            if "bf16_weights" in args.patches:
+                _patches.cast_params(dynamics, "bfloat16")
+                _patches.cast_params(tokenizer, "bfloat16")
+                print("bf16_weights applied to the real checkpoint", flush=True)
+            if "block_attn" in args.patches:
+                n_tok = _patches.tag_block_attention(tokenizer)
+                n_dyn = _patches.tag_block_attention(dynamics, n_latents=512)
+                print(f"block_attn tagged {n_tok} tokenizer + {n_dyn} dynamics",
+                      flush=True)
+                if n_tok + n_dyn == 0:
+                    raise SystemExit("block_attn tagged 0 layers")
 
         import glob
         mp4 = sorted(glob.glob(f"{REPO}/samples/vpt/*.mp4"))[0]
