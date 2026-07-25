@@ -261,3 +261,8 @@ CLAUDE.md
 jelly
 latents
 tokenizer
+
+# Benchmark artifacts: traces, HLO dumps, generated MP4s, fetched results.
+# These are large (80 MB+) and reproducible from the harness in bench/.
+bench/results/
+bench/__pycache__/
