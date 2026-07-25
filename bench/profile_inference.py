@@ -215,7 +215,7 @@ def main():
     ap.add_argument("--patches", nargs="*", default=[],
                     help="optimisations from bench/patches.py: no_roll_kv "
                          "fast_kv_write no_remat block_attn bf16_weights "
-                         "ragged_kv fp8_weights")
+                         "ragged_kv fp8_weights norm_bf16; DIAGNOSTIC (wrong on purpose, bounds a prize): no_norm no_swiglu_gate")
     args = ap.parse_args()
 
     if args.patches:
@@ -262,6 +262,11 @@ def main():
         _patches.cast_params(tokenizer, "bfloat16")
         after = _patches.param_bytes(dynamics) + _patches.param_bytes(tokenizer)
         print(f"bf16_weights   : {before/1e9:.2f} GB -> {after/1e9:.2f} GB resident")
+
+    if "norm_bf16" in args.patches:
+        from bench import patches as _patches
+        _patches.cast_norms(dynamics, "bfloat16")
+        _patches.cast_norms(tokenizer, "bfloat16")
 
     if "fp8_weights" in args.patches:
         from bench import patches as _patches

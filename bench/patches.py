@@ -164,6 +164,48 @@ def cast_params(model, dtype: str = "bfloat16"):
     return model
 
 
+_NORM_STATS = {"retyped": 0}
+
+
+def cast_norms(model, dtype: str = "bfloat16", verbose: bool = True):
+    """Retype every `nnx.RMSNorm` compute dtype, in place. Returns the count.
+
+    Every RMSNorm in the model is built with a hardcoded `dtype=jnp.float32`
+    (models.py:305, 373, 374, 563) while the activations flowing through it are
+    bf16. That is the same shape of defect as the `param_dtype=float32` /
+    `dtype=bfloat16` mismatch that `bf16_weights` fixes, and that one was worth
+    -9.48 ms: XLA has to widen the activation, reduce, and narrow again on
+    every norm, and there are ~120 norms per forward.
+
+    Unlike `no_norm` this is a real candidate, not a diagnostic -- but it is
+    NOT exact. The mean-square reduction moves from fp32 to bf16, so it needs a
+    quality gate before shipping, which `no_norm`/`no_swiglu_gate` do not
+    because they are never going to ship.
+    """
+    target = {"bfloat16": jnp.bfloat16, "float32": jnp.float32}[dtype]
+    n = 0
+    # `iter_modules` is not in every flax version this harness runs against;
+    # `iter_graph` is the older spelling. Fall back rather than fail, since a
+    # silent zero here would look exactly like "norm dtype does not matter".
+    try:
+        it = [m for _p, m in model.iter_modules()]
+    except AttributeError:
+        from flax.nnx import graph as _g
+        it = [m for _p, m in _g.iter_graph(model)]
+    for mod in it:
+        if isinstance(mod, nnx.RMSNorm) and mod.dtype != target:
+            mod.dtype = target
+            n += 1
+    if n == 0:
+        raise RuntimeError(
+            "cast_norms retyped 0 RMSNorm layers -- the walk found none, which "
+            "would silently make this arm identical to the control")
+    _NORM_STATS["retyped"] = n
+    if verbose:
+        print(f"norm_bf16      : retyped {n} RMSNorm layers -> {dtype}")
+    return n
+
+
 def param_bytes(model) -> int:
     _, state, _ = nnx.split(model, nnx.Param, ...)
     return sum(l.size * l.dtype.itemsize for l in jax.tree.leaves(state))
@@ -174,7 +216,14 @@ def param_bytes(model) -> int:
 # ---------------------------------------------------------------------------
 
 ALL = ("no_roll_kv", "fast_kv_write", "no_remat", "block_attn", "fp8_weights",
-       "ragged_kv")
+       "ragged_kv", "no_norm", "no_swiglu_gate")
+
+# Deliberately WRONG patches, for bounding a prize before building a kernel.
+# `no_norm` and `no_swiglu_gate` delete real computation, so any frame time
+# measured under them is a speed-of-light number and not an achievable one.
+# They exist because the alternative -- writing a fused kernel and then finding
+# out it was worth 2% -- is how the fp8 work was wasted.
+DIAGNOSTIC_ONLY = ("no_norm", "no_swiglu_gate")
 
 
 def apply(names, pkg: str = "dreamer"):
@@ -210,13 +259,36 @@ def apply(names, pkg: str = "dreamer"):
             KVCache.update = _ragged_update
             KVCache.get_ordered_kv = _ragged_get_ordered_kv
             models.RotaryEmbedding1D.__call__ = _ragged_rope_call
+        elif name == "no_norm":
+            # DIAGNOSTIC. Upper-bounds every possible RMSNorm fusion at once:
+            # epilogue-fusing norm into the preceding GEMM, a Pallas
+            # norm+residual kernel, bf16 norm I/O -- none of them can beat
+            # deleting the op entirely. If this arm is within noise of the
+            # control, no norm kernel is worth writing.
+            _ORIGINALS.setdefault("RMSNorm.__call__", nnx.RMSNorm.__call__)
+            nnx.RMSNorm.__call__ = lambda self, x, *a, **k: x
+        elif name == "no_swiglu_gate":
+            # DIAGNOSTIC. Drops `u * silu(v)` and the split, keeping both GEMMs
+            # and their shapes intact, so the delta is exactly the elementwise
+            # tail a fused SwiGLU kernel could remove -- no more.
+            _ORIGINALS.setdefault("MLP.__call__", models.MLP.__call__)
+
+            def _mlp_no_gate(self, x, deterministic: bool = True, rngs=None):
+                if self.use_norm:
+                    x = self.norm(x)
+                pre = self.fc_in(x)
+                h = pre[..., : pre.shape[-1] // 2] if self.swiglu else pre
+                return self.fc_out(h)
+
+            models.MLP.__call__ = _mlp_no_gate
         elif name == "fp8_weights":
             _ORIGINALS.setdefault("nnx.Linear.__call__", nnx.Linear.__call__)
             nnx.Linear.__call__ = _linear_fp8_call
-        elif name == "bf16_weights":
-            pass  # handled by cast_params on the built model
+        elif name in ("bf16_weights", "norm_bf16"):
+            pass  # handled on the built model, not by monkeypatching
         else:
-            raise ValueError(f"unknown patch {name!r}; known: {ALL + ('bf16_weights',)}")
+            raise ValueError(f"unknown patch {name!r}; "
+                             f"known: {ALL + ('bf16_weights', 'norm_bf16')}")
         _APPLIED.append(name)
     return _APPLIED
 

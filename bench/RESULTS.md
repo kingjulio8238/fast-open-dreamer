@@ -664,3 +664,90 @@ lengths vary (`--length-cv 0.6`). At `--length-cv 0` the gain collapses to
 1.00-1.19x, because a uniform cohort drains all at once and static batching
 loses nothing. If served sessions really are fixed-length and synchronised,
 static batching is fine and `ragged_kv` is a 5.3% loss for nothing.
+
+---
+
+# How much is left below the GEMMs? Bounded by deleting the ops.
+
+GEMMs are 55.9% of GPU time and cuBLAS already beats anything hand-written
+here (see the Tier 2 rejection). That leaves 44.1% — fusion/other 26.9%,
+copy/transpose 8.3%, reduce/norm 5.7% — which no work so far has touched, and
+which is where fused kernels normally win at low batch.
+
+Rather than write a fused kernel and then discover it was worth 2% (which is
+how the fp8 effort was spent), the prize was bounded first by **deleting the
+ops**. `no_norm` and `no_swiglu_gate` in `bench/patches.py` are deliberately
+WRONG — they remove real computation — so the frame times under them are
+speed-of-light numbers no kernel can beat.
+
+B=1, recommended stack, one container (log `blaepzd4f`):
+
+| arm | frame B=1 | vs control | what it bounds |
+|---|---:|---:|---|
+| control | 26.341 ms | — | |
+| `norm_bf16` (real candidate) | 26.454 ms | **+0.4%** | fp32→bf16 norm compute |
+| `no_norm` (delete every RMSNorm) | 24.119 ms | **−8.4%** | *every* norm kernel |
+| `no_swiglu_gate` (delete `u*silu(v)`) | 25.155 ms | **−4.5%** | a fused SwiGLU |
+| both | 24.491 ms | −7.0% | the two combined |
+
+The combined arm being *slower* than `no_norm` alone puts the noise floor at
+~1.5%, so read these as ceilings of ~8% / ~4% / ~8%, not as additive.
+
+**Two conclusions, both negative and both cheap to have obtained.**
+
+`norm_bf16` was a real hypothesis and it is dead. Every RMSNorm is built with a
+hardcoded `dtype=jnp.float32` (`models.py:305, 373, 374, 563`) while
+activations are bf16 — structurally the same defect as the
+`param_dtype=float32`/`dtype=bfloat16` mismatch that `bf16_weights` fixes for
+−9.48 ms. Retyping all 200 norm layers (120 dynamics + 80 tokenizer, counter
+confirmed) changes **nothing**. XLA was evidently already handling the
+reduction well regardless of the declared dtype. One arm, hypothesis falsified,
+no kernel written.
+
+**Every fused kernel that could be written for this model is bounded at ~8%,
+and realistically captures about half of that.** Epilogue-fusing norm into the
+preceding GEMM, a Pallas norm+residual kernel, a fused SwiGLU, a persistent
+megakernel — none can beat deleting the op, and deleting *all* of them is 8%.
+Against 2.23x from removing three of five forwards, kernel work is not where
+the value is. **This is the measured answer to "how far down does it pay to
+go": not very.**
+
+## Hardware axis — blocked on the toolchain, not on the hardware
+
+The frame splits into a bandwidth-bound half and a compute-bound half, so the
+device is a first-class variable. `GPU_TYPE` is now `BENCH_GPU`-overridable.
+Holding the *achieved* efficiency measured on H100 (50% of HBM, 52% of MFU):
+
+| device | HBM GB/s | bf16 TFLOP/s | fixed | marginal | B=1 ms | B=1 fps | vs H100 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| H100 | 2353 | 742 | 13.34 | 13.00 | 26.35 | 38.0 | 1.00x |
+| H200 | 4800 | 990 | 6.54 | 9.75 | 16.29 | 61.4 | 1.61x |
+| B200 | 8000 | 2250 | 3.92 | 4.29 | 8.22 | 121.7 | **3.20x** |
+
+**Optimistic bounds, not predictions** — M=290 is harder to saturate on a
+bigger machine, so achieved efficiency will fall.
+
+Measuring it is blocked: a B200 provisions fine (183359 MiB, log `bqinilwxu`)
+but every run aborts with `Unsupported conversion from bf16 to f16 / LLVM
+ERROR: Unsupported rounding mode for conversion`, with and without the cuDNN
+attention path. The image pins **jax 0.4.38 / jaxlib 0.4.38** (Dec 2024),
+which predates Blackwell support. This is a bounded image rebuild (jax >= 0.5,
+CUDA 12.8+), not a property of the model — and it would also let this fork's
+own `dreamer/parallel.py` import, which currently needs a `jax.sharding.AxisType`
+that does not exist in 0.4.38.
+
+## ROI, measured rather than asserted
+
+| lever | gain | status | layer |
+|---|---:|---|---|
+| distillation, 5 → 2 forwards | **2.23x** | not started | algorithm |
+| B200 | up to 3.20x | **blocked**, toolchain | hardware |
+| tensor parallel, TP=2 | ~1.7x (at 2x the GPUs) | untested | deployment |
+| continuous batching | 1.59x under real arrivals | **built + verified** | scheduling |
+| every fusion kernel, combined | **<=8%**, ~4% realistic | **measured ceiling** | kernels |
+| RMSNorm fp32 → bf16 | **0%** | measured, dead | kernels |
+| fp8/int8 GEMM | negative | measured twice, dead | kernels |
+
+The value is at the top of the stack, not the bottom. Going "all the way down
+to the silicon" is exactly where the least is left, and that is now a
+measurement rather than an opinion.

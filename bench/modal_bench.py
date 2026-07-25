@@ -35,12 +35,16 @@ container exit.
 from __future__ import annotations
 
 import modal
+import os
 import re
 
 # ---------------------------------------------------------------------------
 # Knobs
 # ---------------------------------------------------------------------------
-GPU_TYPE = "H100"          # "H100" | "H200" | "A100-80GB" | "B200" | "L40S"
+GPU_TYPE = os.environ.get("BENCH_GPU", "H100")   # H100 | H200 | A100-80GB | B200 | L40S
+# Overridable because the frame cost decomposes into a bandwidth-bound half
+# and a compute-bound half, so the device is a first-class variable here,
+# not a fixed part of the harness. `BENCH_GPU=B200 modal run ...`
 PYTHON_VERSION = "3.11"    # the inference repo pins >=3.11,<3.12
 
 # reactor-team/open-dreamer @ "Rework README into a landing page (#1)".
