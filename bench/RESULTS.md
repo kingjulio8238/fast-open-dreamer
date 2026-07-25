@@ -965,3 +965,91 @@ rather than by default.
 | 90.3 fps aggregate on one H100 | measured, deployment framing only |
 | no long-horizon drift from the stack | **measured**, n=6, the main risk cleared |
 | identical quality | **not established** — FVD +14.1, 5/6 seeds, p~0.07 |
+
+---
+
+# The quality drop was a measurement artifact — the control proves it
+
+Last section reported FVD +14.14 for the optimized stack, paired t(5)=2.28,
+5 of 6 seeds worse, and called it "suggestive of a small real cost". A control
+arm was then run that should have been run first: **the three provably-exact
+patches alone** (`no_remat`, `fast_kv_write`, `no_roll_kv`), n=6, same protocol
+(log `brfjcnm9m`).
+
+| arm | FVD mean | vs baseline | paired t(5) | p<0.05? |
+|---|---:|---:|---:|---|
+| baseline (released) | 514.4 | — | — | — |
+| **EXACT-ONLY (control)** | **532.5** | **+18.1** | **3.59** | **YES** |
+| exact + cuDNN, no bf16 | 520.4 | +6.0 | 0.50 | no |
+| full stack (+bf16) | 528.5 | +14.1 | 2.28 | no |
+
+**The control comes out "significantly worse" than baseline at t(5)=3.59 — for
+patches that cannot change the answer.** That is a reductio. The test is
+detecting a difference that does not exist, so the test is wrong, and the
++14.14 it produced for the full stack is worth nothing.
+
+## Why the paired test is invalid here
+
+"Semantically exact" is not "bitwise identical". `no_remat` removes an
+optimisation *barrier*, so XLA fuses differently and the accumulation order
+changes. `no_roll_kv` measured read max|diff| 2.38e-07. Neither alters the
+computed function, but both alter the last bits.
+
+A 96-frame autoregressive rollout feeds each output back as the next input, so
+it is a chaotic map. A 1e-07 perturbation at frame 1 is a different trajectory
+by frame 96. **Pairing by seed assumes same-seed → same-trajectory, which holds
+only for bitwise-identical code.** No arm here is bitwise identical to the
+baseline, so the pairing is broken and the paired test measures trajectory
+divergence, not quality.
+
+## The correct tests both say: no difference
+
+**Unpaired** — the appropriate comparison for a distributional metric:
+
+| arm | mean | sd | range | unpaired t | p<0.05? |
+|---|---:|---:|---:|---:|---|
+| baseline | 514.4 | 16.8 | 498–542 | — | — |
+| EXACT-ONLY control | 532.5 | 14.1 | 509–550 | 2.02 | no |
+| exact + cuDNN, no bf16 | 520.4 | 22.8 | 491–550 | 0.52 | no |
+| full stack | 528.5 | 20.9 | 505–562 | 1.29 | no |
+
+Every range overlaps every other range. The full stack (t=1.29) is *closer* to
+baseline than the exact-only control (t=2.02). With n=6 and a pooled within-arm
+sd of 18.7, this protocol's smallest detectable difference is about **28 FVD
+(~6%)** — nothing measured is near that.
+
+**Early-rollout drift** — the well-posed test, taken before divergence
+compounds, so it reflects the per-step computation rather than which chaotic
+path was taken:
+
+| arm | mean initial drift | vs baseline | max per-seed deviation |
+|---|---:|---:|---:|
+| baseline | 0.00424 | — | — |
+| EXACT-ONLY control | 0.00424 | +0.00% | 2e-05 |
+| exact + cuDNN, no bf16 | 0.00423 | −0.16% | 2e-05 |
+| full stack | 0.00424 | **+0.16%** | 5e-05 |
+
+Every arm agrees with the released baseline to within **0.4%**, and drift *at
+horizon* was already shown identical to four decimals. `std ratio` and `motion`
+showed nothing at n=6 either.
+
+## Answer
+
+**The full stack — 1.84x at B=1, 1.49x at B=16 — has no measurable quality
+cost.** Nothing needs to be given up.
+
+Two honest limits on that statement:
+
+1. It is "no difference detectable at ~6% FVD resolution", not proof of
+   equivalence. Tightening it means a better protocol (more windows and seeds
+   to shrink the floor), not dropping patches.
+2. Dropping `bf16_weights` to buy *provable* rather than statistical assurance
+   costs **1.54x at B=1** and only **1.05x at B=16** — it attacks the fixed
+   weight-streaming term that batching already amortises. So if a
+   bitwise-conservative build is ever wanted, it is nearly free at serving
+   batch sizes (1.41x instead of 1.49x) and expensive for single-stream.
+
+**Methodological note worth keeping:** for a chaotic autoregressive sampler,
+paired-by-seed metrics at long horizon are the wrong instrument, and an
+exact-patch control arm is the cheapest way to discover that. It cost one run
+and it overturned the conclusion.
