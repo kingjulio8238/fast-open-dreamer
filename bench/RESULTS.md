@@ -751,3 +751,123 @@ that does not exist in 0.4.38.
 The value is at the top of the stack, not the bottom. Going "all the way down
 to the silicon" is exactly where the least is left, and that is now a
 measurement rather than an opinion.
+
+---
+
+# Profiling the SHIPPED config — and the largest win since `bf16_weights`
+
+Every earlier trace in this document was of something other than the shipped
+configuration: the kernel-class table came from a steps=2 run, and the fusion
+attribution came from log `b3uxndq1l`, which had the XLA SDPA arm *and*
+dynamics block_attn, neither of which ships. Log `bi9diven2` is the first trace
+of what is actually served — steps=4, bf16 weights, cuDNN block_attn, B=1, H100.
+
+    frame B=1  26.136 ms   25.9% MFU
+    in-iteration occupancy 95.6%   (4.4% idle, 1.5% of it sub-10us)
+    18165 kernels, mean 6.26 us
+    memory: peak 11.77 GB, in use 4.75 GB, largest single alloc 0.27 GB
+    dynamics KV cache resident 0.342 GB (window 192, 8 time layers)
+
+| class | ms | % |
+|---|---:|---:|
+| GEMM | 66.90 | 58.8% |
+| fusion/other | 26.02 | 22.9% |
+| copy/transpose | 9.20 | 8.1% |
+| reduce/norm | 6.98 | 6.1% |
+| dtype convert | 2.71 | 2.4% |
+| attention/softmax | 1.95 | 1.7% |
+
+## What the fusion→source join found
+
+| ms | % of resolved | calls | source / op |
+|---:|---:|---:|---|
+| 10.21 | 16.7% | 605 | `models.py:402` dot_general |
+| **10.18** | **16.6%** | 750 | **`models.py:439` convert_element_type** |
+| **9.57** | **15.6%** | 2045 | **`models.py:439` dot_general** |
+| 3.47 | 5.7% | 25 | `models.py:1336` concatenate (token assembly) |
+| 3.17 | 5.2% | 740 | `models.py:332` dot_general |
+| 2.62 | 4.3% | 750 | `models.py:609` reduce_sum |
+| 1.26 | 2.0% | 545 | `models.py:439` transpose |
+
+`models.py:439` is `jax.nn.dot_product_attention`, and it totals **21.0 ms of
+113.5 ms GPU-busy — 18.5% of all GPU time**, with `gemm_fusion_dot_832_0`
+carrying shape `f32[290,...]`: the score matrix is being materialised in fp32.
+
+The cause was already written down in this document and not acted on:
+**`implementation=None` does not mean "pick the best backend", it means the XLA
+reference path.** `block_attn` never fixed this for dynamics — it reports
+"tagged 15 tokenizer + **0 dynamics**", because the dynamics space mask is a
+`(1,1,290,290)` tracer whose 1/290 split is degenerate. So all 30 layers x 5
+forwards of dynamics attention ran the reference path, while the
+`attention/softmax` class showed only 1.95 ms — that 1.95 ms was the
+*tokenizer's* real cuDNN calls, and it made the dynamics cost invisible under
+"GEMM" and "fusion".
+
+## `sdpa_cudnn` — measured
+
+Same container, one patch (log `bl9krd2pl`). 314 call sites took cuDNN, 0 were
+rejected; the profiler hard-fails if that count is ever 0, so an all-fallback
+run cannot be misreported as applied.
+
+| stage | control | `sdpa_cudnn` | |
+|---|---:|---:|---|
+| frame B=1 | 27.053 ms | **24.005 ms** | 1.13x |
+| dyn_fwd B=8 | 24.410 ms | 18.396 ms | 1.33x |
+| ladder B=8 | 109.607 ms | 88.963 ms | 1.23x |
+| frame B=8 | 116.474 ms | **95.082 ms** | **1.22x** |
+| frame B=8 MFU | 46.5% | **57.0%** | |
+
+**Correctness.** Acceptance is not correctness — a backend that ignored the
+mask would also accept and would also be fast. `check_sdpa_cudnn_equivalence`
+tests both dynamics mask regimes against the reference the released code was
+getting by default, plus a negative control:
+
+    space mask         rel 5.49e-03
+    causal + window    rel 5.41e-03
+    mask-actually-applied separation 2.75e+00   (vs tol 3e-2)
+
+The first two are the same order as `block_attn`'s 5.10e-03 and are bf16
+accumulation-order differences. The third is the load-bearing one: masked and
+unmasked cuDNN outputs differ by 90x the tolerance, so the mask is genuinely
+being applied.
+
+## The roofline moved
+
+Re-measured batch curve (log `bi2a2sns6`), still affine:
+
+| | fixed | marginal | ceiling |
+|---|---:|---:|---:|
+| before | 13.33 ms | 12.93 ms | 77.4 fps |
+| **after** | 12.88 ms | **10.21 ms** | **97.9 fps** |
+
+The fixed term barely moves (−3%) and the **marginal term drops 21%**. That
+matters more than the headline: the marginal term is per-stream compute, the
+one batching cannot amortise and quantisation cannot touch. Every previous win
+in this document attacked the fixed half.
+
+| B | frame | agg fps | real-time streams/H100 |
+|---:|---:|---:|---:|
+| 1 | 24.278 ms | 41.2 | 2.1 |
+| 2 | 33.794 | 59.2 | 3.0 |
+| 4 | 52.718 | 75.9 | 3.8 |
+| 8 | 93.079 | 85.9 | 4.3 |
+| 16 | 177.190 | **90.3** | **4.5** |
+
+Peak memory at B=16 is 23.38 GB of 80.77, largest single alloc 0.68 GB.
+
+**New headline: 44.35 -> 24.278 ms at B=1 = 1.83x, 22.5 -> 41.2 fps. At B=16,
+90.3 fps aggregate = 4.00x the released baseline.**
+
+## What this says about the earlier "kernels are dry" conclusion
+
+That conclusion was measured and it was also scoped too narrowly. The `no_norm`
+/ `no_swiglu_gate` ablation correctly bounded *fusion* work at ~8%, and that
+still holds. But it bounded the wrong thing: the biggest remaining cost was not
+a fusion that needed writing, it was **a backend that was never selected**. The
+ablation could not have found it, because deleting norms says nothing about
+which SDPA kernel runs.
+
+The lesson for what remains: prefer profiling the *shipped* configuration and
+attributing time to source lines over reasoning about kernel classes in the
+abstract. The kernel-class table said "GEMM 58.8%, attention 1.7%" and that was
+true and completely misleading.

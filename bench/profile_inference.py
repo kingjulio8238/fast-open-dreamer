@@ -534,6 +534,34 @@ def main():
         if st["unmatched"]:
             print(f"  masks not recognised as 2-block: {st['unmatched']}")
 
+    # Where the memory went, not just the time. `peak_bytes_in_use` is the high
+    # water mark across everything run above, so it answers "what does serving
+    # this actually need" -- the number that decides how many concurrent
+    # sessions fit before the B=32 prefill OOM.
+    try:
+        st = jax.local_devices()[0].memory_stats() or {}
+        gb = lambda k: st.get(k, 0) / 1e9
+        print(f"\nmemory: peak {gb('peak_bytes_in_use'):.2f} GB | "
+              f"in use {gb('bytes_in_use'):.2f} GB | "
+              f"limit {gb('bytes_limit'):.2f} GB | "
+              f"largest single alloc {gb('largest_alloc_size'):.2f} GB")
+        results["memory"] = {k: st.get(k) for k in
+                             ("peak_bytes_in_use", "bytes_in_use",
+                              "bytes_limit", "largest_alloc_size")}
+    except Exception as e:
+        print(f"\nmemory: unavailable ({type(e).__name__})")
+
+    if "sdpa_cudnn" in args.patches:
+        from bench import patches as _p
+        ss = _p.sdpa_stats()
+        results["sdpa_stats"] = ss
+        print(f"\nsdpa_cudnn: {ss['cudnn']} call sites took cuDNN, "
+              f"{ss['rejected']} were rejected and fell back")
+        if ss["cudnn"] == 0:
+            raise SystemExit(
+                "sdpa_cudnn: cuDNN accepted 0 call sites -- this arm is "
+                "identical to the control and must not be reported as applied")
+
     if args.json:
         Path(args.json).write_text(json.dumps(results, indent=2))
         print(f"\nwrote {args.json}")

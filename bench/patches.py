@@ -164,6 +164,48 @@ def cast_params(model, dtype: str = "bfloat16"):
     return model
 
 
+# ---------------------------------------------------------------------------
+# sdpa_cudnn  --  route the DYNAMICS attention through cuDNN
+# ---------------------------------------------------------------------------
+
+_SDPA_STATS = {"cudnn": 0, "rejected": 0}
+
+
+def _sdpa_cudnn(*args, **kwargs):
+    """`jax.nn.dot_product_attention` with `implementation="cudnn"` injected.
+
+    `models.py:439` calls SDPA with `implementation` unset, and unset does NOT
+    mean "pick the best backend" -- it means the XLA reference path, which
+    materialises the score matrix. `block_attn` never fixed this for the
+    dynamics model: it tags "15 tokenizer + 0 dynamics" layers, because the
+    dynamics space mask is a `(1,1,290,290)` tracer whose 1/290 split is
+    degenerate. So all 30 layers x 5 forwards of dynamics attention run the
+    reference path, and the shipped-config trace attributes 21.0 ms of 113.5 ms
+    GPU-busy to `models.py:439` -- 10.18 ms of it pure `convert_element_type`,
+    with the scores landing in `f32[290,...]`.
+
+    cuDNN may refuse a given mask/shape. That refusal is raised at trace time,
+    so it is caught here and the original call is retried unchanged; the
+    counters record which way each call site went. A silent fallback would make
+    this patch look applied when it was not, which is the exact failure mode
+    that made `block_attn` no-op twice.
+    """
+    orig = _ORIGINALS["jax.nn.dot_product_attention"]
+    if kwargs.get("implementation") is not None:
+        return orig(*args, **kwargs)      # block_attn already chose one
+    try:
+        out = orig(*args, **{**kwargs, "implementation": "cudnn"})
+        _SDPA_STATS["cudnn"] += 1
+        return out
+    except Exception:
+        _SDPA_STATS["rejected"] += 1
+        return orig(*args, **kwargs)
+
+
+def sdpa_stats():
+    return dict(_SDPA_STATS)
+
+
 _NORM_STATS = {"retyped": 0}
 
 
@@ -216,7 +258,7 @@ def param_bytes(model) -> int:
 # ---------------------------------------------------------------------------
 
 ALL = ("no_roll_kv", "fast_kv_write", "no_remat", "block_attn", "fp8_weights",
-       "ragged_kv", "no_norm", "no_swiglu_gate")
+       "ragged_kv", "no_norm", "no_swiglu_gate", "sdpa_cudnn")
 
 # Deliberately WRONG patches, for bounding a prize before building a kernel.
 # `no_norm` and `no_swiglu_gate` delete real computation, so any frame time
@@ -259,6 +301,11 @@ def apply(names, pkg: str = "dreamer"):
             KVCache.update = _ragged_update
             KVCache.get_ordered_kv = _ragged_get_ordered_kv
             models.RotaryEmbedding1D.__call__ = _ragged_rope_call
+        elif name == "sdpa_cudnn":
+            _ORIGINALS.setdefault("jax.nn.dot_product_attention",
+                                  jax.nn.dot_product_attention)
+            jax.nn.dot_product_attention = _sdpa_cudnn
+            models.jax.nn.dot_product_attention = _sdpa_cudnn
         elif name == "no_norm":
             # DIAGNOSTIC. Upper-bounds every possible RMSNorm fusion at once:
             # epilogue-fusing norm into the preceding GEMM, a Pallas
@@ -1202,3 +1249,62 @@ def check_ragged_kv_equivalence(pkg: str | None = None, window: int = 16,
           f"{steps} writes; ragged {worst_ragged:.2e} across offsets {offsets} "
           f"(window {window})")
     return max(worst_aligned, worst_ragged)
+
+
+def check_sdpa_cudnn_equivalence(tol: float = 3e-2, verbose: bool = True):
+    """cuDNN SDPA vs the XLA reference, on the mask shapes dynamics actually uses.
+
+    `sdpa_cudnn` reported "314 call sites took cuDNN, 0 rejected". Acceptance is
+    NOT correctness: a backend that silently ignored the mask would also accept,
+    and would also be fast. These are the two mask regimes in the dynamics
+    model, checked against the reference implementation the released code was
+    getting by default:
+
+      SPACE  a dense (1,1,S,S) boolean modality mask, S=290
+      TIME   causal with a sliding window, which is what the KV cache path uses
+
+    Tolerance is loose because both paths are bf16 and cuDNN accumulates in a
+    different order; it matches the tolerance `check_block_attn_equivalence`
+    already uses for the same reason.
+    """
+    orig = _ORIGINALS.get("jax.nn.dot_product_attention",
+                          jax.nn.dot_product_attention)
+    key = jax.random.PRNGKey(0)
+    B, S, N, K, H = 2, 290, 30, 3, 64
+    q = jax.random.normal(key, (B, S, N, H), jnp.bfloat16)
+    k = jax.random.normal(key, (B, S, K, H), jnp.bfloat16)
+    v = jax.random.normal(key, (B, S, K, H), jnp.bfloat16)
+
+    results = {}
+    # SPACE: a genuinely non-trivial 2-block modality mask, not all-ones --
+    # an ignored mask has to actually change the answer for this to have teeth.
+    m = jnp.zeros((1, 1, S, S), bool).at[:, :, :, :2].set(True)
+    m = m.at[:, :, 2:, 2:].set(True)
+    ref = orig(q, k, v, mask=m)
+    got = orig(q, k, v, mask=m, implementation="cudnn")
+    d = float(jnp.max(jnp.abs((got - ref).astype(jnp.float32))))
+    r = d / float(jnp.max(jnp.abs(ref.astype(jnp.float32))))
+    results["space_mask"] = (d, r)
+
+    # TIME: causal + sliding window, the KV-cache regime.
+    ref = orig(q, k, v, is_causal=True, local_window_size=(191, 0))
+    got = orig(q, k, v, is_causal=True, local_window_size=(191, 0),
+               implementation="cudnn")
+    d2 = float(jnp.max(jnp.abs((got - ref).astype(jnp.float32))))
+    r2 = d2 / float(jnp.max(jnp.abs(ref.astype(jnp.float32))))
+    results["causal_window"] = (d2, r2)
+
+    # Negative control: if cuDNN were ignoring the mask, its masked output
+    # would equal its UNMASKED output. Assert it does not.
+    unmasked = orig(q, k, v, implementation="cudnn")
+    masked = orig(q, k, v, mask=m, implementation="cudnn")
+    sep = float(jnp.max(jnp.abs((masked - unmasked).astype(jnp.float32))))
+
+    ok = r < tol and r2 < tol and sep > 10 * tol
+    if verbose:
+        print(f"check_sdpa_cudnn_equivalence: {'PASS' if ok else 'FAIL'}  "
+              f"space rel {r:.2e}, causal+window rel {r2:.2e}, "
+              f"mask-actually-applied separation {sep:.2e} (tol {tol})")
+    if not ok:
+        raise AssertionError(f"sdpa cudnn equivalence failed: {results}, sep={sep}")
+    return results
